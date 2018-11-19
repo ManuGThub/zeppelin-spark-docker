@@ -1,0 +1,136 @@
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.Row
+
+//variable de path del csv
+val data ="/data/slice_violations.csv"
+//constante para hacer el join entre data frames
+val JOIN_COLUMN: String = "rn"
+
+//definicion de una funcion que aplica un join entre dos dataframes y devuelve
+//otro data frame como resultado
+def joinDataFrames(df: DataFrame, df2: DataFrame,joinCol: String) : DataFrame = {
+    df.join(df2, Seq(joinCol))
+}
+//funcion para filtrar por los accidentes donde hubo heridos utilizando un iterador
+def filterInjuried(RDDrows: Iterator[Row]) : Iterator[Row] = 
+  RDDrows.filter(row => row(10) == "true")
+
+//funcion para el filtrado y formateo del dataframe resultado utilizando map partitions
+def filterMapPartitions(df: DataFrame) : DataFrame = {
+     val dfRES = df.rdd.mapPartitions(filterInjuried).
+     map(row => (row.getString(21), row.getString(22), row.getString(23))).
+     toDF("Mark", "Model", "Color")
+     dfRES
+}
+
+//funcion para filtrar por accidentes donde hubo heridos y darle formato
+def filterDF(df: DataFrame) : DataFrame = {
+     val dfRES = df.filter(df("personal_injury") === "true").
+     map(row => (row.getString(21), row.getString(22), row.getString(23))).
+     toDF("Mark", "Model", "Color")
+     dfRES
+}
+
+    
+//dataframe con los datos cargados
+val df = spark.read.format("csv").option("header", "true").load(data)
+//df.printSchema()
+//df.limit(1).show()
+
+//val dfFiltered=filterMapPartitions(df) //filtrado utilizando mapPartitions
+val dfFiltered=filterDF(df)  //filtrado utilizando un filter sobre el data frame
+
+val groupByRDD = dfFiltered.rdd.
+map(x => ((x.get(0),x.get(1),x.get(2)).toString, 1)). //mapeamos marca, modelo y color (KEY) a 1 (VALUE)
+reduceByKey{case (x, y) => x + y}. //Hacemos un reduce by key
+map(r => (r._2,r._1)). //damos la vuelta a las columnas, para que primero aparezca el count y despues la marca,modelo y color
+sortBy(r => (-r._1, r._2)).// ordenamos por la primera columna (count) de manera descendente y por la segunda de manera ascendente
+toDF("Count","Mark - Model - Color").persist //convertimos el RDD a DataFrame aplicando "persist" para que lo cargue en memoria, ya que vamos a hacer
+                                             //varias operaciones con el
+
+//groupByRDD.show()
+
+//aplicamos un DENSE_RANK para ver que posiciones en el ranking
+val windowSpecDR = Window.orderBy(col("Count").desc)
+val dfDataDR = groupByRDD.withColumn("dr", dense_rank().over(windowSpecDR)) 
+//dfDataDR.show
+
+//añadimos al dataframe la columna "rn" aplicando un ROW_NUMBER() ordenando
+//por Count de manera descendente y "marca -modelo-color" ascendente
+val windowSpecRN = Window.orderBy(col("Count").desc,col("Mark - Model - Color"))
+val dfDataRN = groupByRDD.withColumn("rn", row_number().over(windowSpecRN))
+//dfDataRN.show()
+
+
+//aplicamos otro ROW_NUMBER, pero esta vez sobre el dataframe donde previamente hemos aplicado el DENSE_RANK()
+// para seleccionar las primeras filas de cada conjunto de datos en el Count
+val window_RN_over_DR = Window.partitionBy(col("dr")).orderBy(col("dr").desc)
+val dfData_RN_over_DR = dfDataDR.withColumn("rn", row_number().over(window_RN_over_DR))
+//dfData_RN_over_DR.show()
+
+//nos quedamos solo con las filas donde rn sea igual a 1 para despreciar el resto
+val dfData_RN_over_DR_filtered = dfData_RN_over_DR.filter(dfData_RN_over_DR("rn") === 1).drop("rn").drop("dr")
+dfData_RN_over_DR_filtered.show()
+
+/*
+#primeras ocurrencias de cada conjunto de número de accidentes:
+#ejemplo de lo que debe mostrar:
+#+-----+--------------------+---+---+
+#|Count|Mark - Model - Color| dr| rn|
+#+-----+--------------------+---+---+
+#|    6|  [SUNNY,NINGBO,RED]|  1|  1|<---
+#|    5|[ACURA,INTEGRA,BL...|  2|  1|<---
+#|    5|[CHRYSLER,SEBRING...|  2|  2|
+#|    5|[FORD,EXPLORER,GR...|  2|  3|
+#|    5|  [HONDA,CIVIC,GRAY]|  2|  4|
+#|    5|  [MITS,LANCER,GRAY]|  2|  5|
+#|    4|[CHRYSLER,PACIFIC...|  3|  1|<---
+#|    4|  [DODGE,DAKOTA,RED]|  3|  2|
+#|    4|  [HONDA,PILOT,GRAY]|  3|  3|
+#|    4|   [KIA,TRUCK,BLACK]|  3|  4|
+#|    3|   [ACUR,RDX,SILVER]|  4|  1|<---
+#|    3| [HONDA,ACCORD,BLUE]|  4|  2|
+#|    3|[INFINITI,SEDAN,G...|  4|  3|
+#|    3| [TOYO,CAMRY,SILVER]|  4|  4|
+#|    3|[TOYOTA,COROLLA,S...|  4|  5|
+#|    3|[TOYOTA,COROLLA,TAN]|  4|  6|
+#|    2|     [CHEV,SU,BLACK]|  5|  1|<---
+#|    2|[FORD,EXPEDITION,...|  5|  2|
+#|    2|     [HOND,4S,BLACK]|  5|  3|
+#|    2| [HONDA,CIVIC,BLACK]|  5|  4|
+#+-----+--------------------+---+---+
+*/
+
+
+//para establecer un ranking en base al numero de ocurrencias y poder mostrar despues
+//del join los 3 primeros coches con mas accidentes
+
+val rankingSequence = Seq(Row(1),Row(2),Row(3))
+val schema = List(StructField("rn", IntegerType, true))
+val dfRanking = spark.createDataFrame(spark.sparkContext.parallelize(rankingSequence), StructType(schema))
+
+//dfRanking.show()
+
+//hacemos el join de los dos dataframes llamando a la funcion joinDataFrames
+//y cruzando por la columna "rn" para que nos saque los 3 coches con mas
+//accidentes
+val DF_join = joinDataFrames(dfDataRN,dfRanking,JOIN_COLUMN)
+
+
+//renombramos la columna
+DF_join.orderBy(JOIN_COLUMN).withColumnRenamed(JOIN_COLUMN, "Ranking").show()
+
+/*
+#ejemplo de lo que debe mostrar:
+#+-----+--------------------+---+
+#|Count|Mark - Model - Color| rn|
+#+-----+--------------------+---+
+#|    6|  [SUNNY,NINGBO,RED]|  1|<---
+#|    5|[ACURA,INTEGRA,BL...|  2|<---
+#|    5|[CHRYSLER,SEBRING...|  3|<---
+#|    5|[FORD,EXPLORER,GR...|  4|
+#|    5|  [HONDA,CIVIC,GRAY]|  5|
+#|    5|  [MITS,LANCER,GRAY]|  6|
+*/
